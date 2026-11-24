@@ -296,6 +296,20 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    /// The legacy geometry stage accepts triangles without adjacency.
+    pub(crate) fn supports_input_topology(
+        &self,
+        topology: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY,
+    ) -> bool {
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+        };
+        matches!(
+            topology,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST | D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+        ) || self.stages.iter().all(|stage| stage.program != Program::Gs)
+    }
+
     /// A host pipeline for vertex (or mesh), optionally geometry, and pixel
     /// shaders with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
@@ -714,5 +728,231 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod geometry_tests {
+    use super::*;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    #[test]
+    fn geometry_stage_draws_through_the_guest_state() {
+        // Guest triangle list and direct rectangles expanded to host triangles.
+        for topology in [4, 17] {
+            draw_and_check_target(topology);
+        }
+    }
+
+    fn draw_and_check_target(topology: u32) {
+        let Some(host) = host() else { return };
+        let source = r#"
+struct V { float4 pos : SV_Position; float4 color : COLOR; };
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.pos = float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1);
+    v.color = float4(0, 1, 0, 1);
+    return v;
+}
+[maxvertexcount(3)]
+void gs(triangle V input[3], inout TriangleStream<V> stream) {
+    for (uint i = 0; i < 3; i++) {
+        V v = input[i];
+        v.color = v.color.yxzw;
+        stream.Append(v);
+    }
+    stream.RestartStrip();
+}
+float4 ps(V input) : SV_Target { return input.color; }
+"#;
+        let shader = |stage, hw, program, entry, profile| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source lives through the compiler call.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("geometry_test"),
+                    None,
+                    None,
+                    entry,
+                    profile,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .unwrap();
+            }
+            let code = code.unwrap();
+            // SAFETY: the blob owns the shader's bytes.
+            let dxil = unsafe {
+                std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                )
+            }
+            .to_vec();
+            let shader = super::super::shader(stage, &dxil);
+            let _ = shader.translated[program as usize].set(Some(Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: hw,
+                    dxil,
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                },
+                used: Vec::new(),
+            }));
+            shader
+        };
+        use victory_shader::HwStage::{Es, Gs, Ps};
+        let shaders = vec![
+            shader("vertex", Es, Program::Es, s!("vs"), s!("vs_5_1")),
+            shader("geometry", Gs, Program::Gs, s!("gs"), s!("gs_5_1")),
+            shader("pixel", Ps, Program::Main, s!("ps"), s!("ps_5_1")),
+        ];
+        let mut graphics = GraphicsState::default();
+        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        graphics.depth.DepthEnable = false.into();
+        graphics.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        graphics.targets.NumRenderTargets = 1;
+        graphics.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let null = std::ptr::null();
+        let mut pipeline = null;
+        assert_eq!(
+            super::super::hand_out(
+                shaders,
+                Some(Box::new(graphics)),
+                &super::super::PIPELINE_IIDS[0],
+                &mut pipeline
+            ),
+            0
+        );
+        // The guest host pipeline builds on a worker.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pso = loop {
+            if let Some(pso) = super::super::host_pipeline(pipeline) {
+                break pso;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "geometry pipeline did not build"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            pso.stages
+                .iter()
+                .map(|stage| stage.program)
+                .collect::<Vec<_>>(),
+            [Program::Es, Program::Gs, Program::Main]
+        );
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+        };
+        assert!(pso.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST));
+        assert!(pso.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP));
+        assert!(!pso.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY_LINELIST));
+        assert!(!pso.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ));
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut target = None;
+        // SAFETY: the target description is complete and the out pointer is ours.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+        }
+        let target: ID3D12Resource = target.unwrap();
+        let list = host.new_list().unwrap();
+        let rtv = host.rtv(&target, None);
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipeline);
+        state.set_topology(&list, topology);
+        crate::draw::viewports(
+            &list,
+            &[D3D12_VIEWPORT {
+                Width: 8.0,
+                Height: 8.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }],
+        );
+        crate::draw::scissors(
+            &list,
+            &[RECT {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            }],
+        );
+        // SAFETY: a live target in render-target state.
+        unsafe {
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+        }
+        state.draw(&list, 3, 1, 0, 0);
+        // SAFETY: the draw uses the target only as an RTV before the readback.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        let (readback, fp) = crate::capture::read_back(&host.device, &list.list, &target).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy completed and the row pitch covers all the texels.
+        unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let texel = data.cast::<u8>().add(fp.Offset as usize);
+            for y in 0..8 {
+                let row =
+                    std::slice::from_raw_parts(texel.add(y * fp.Footprint.RowPitch as usize), 32);
+                assert!(
+                    row.chunks_exact(4).all(|rgba| rgba == [255, 0, 0, 255]),
+                    "topology {topology}, row {y}"
+                );
+            }
+            readback.Unmap(0, None);
+        }
+        let release =
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(pipeline, 0x10);
+        assert_eq!(release(pipeline), 0);
     }
 }
