@@ -1263,6 +1263,41 @@ mod tests {
     }
 
     #[test]
+    fn wave32_spilled_mask_guards_the_restored_lanes() {
+        // Two independent comparisons give us distinguishable masks in s2 and s3.
+        // Inline constants start at operand 128; operand 4 means a run-time index in s4.
+        for (write_lane, write_src, read_lane, expected) in [
+            (130, 3, 129, Some(0)), // write lane 2, read the original mask from lane 1
+            (129, 3, 129, Some(1)), // overwrite lane 1 with the second mask
+            (129, 4, 129, None),    // overwrite with an unknown scalar
+            (130, 3, 131, None),    // read an unwritten lane
+            (4, 3, 129, None),      // unknown write index might alias lane 1
+            (130, 3, 4, None),      // unknown read index
+            (161, 3, 129, Some(1)), // lane 33 aliases lane 1 in wave32
+        ] {
+            let p = build(&[
+                0xD4C2_0002, 0x0002_0080, // v_cmp_eq_u32 s2, 0, v0
+                0xD4C2_0003, 0x0002_0280, // v_cmp_eq_u32 s3, 0, v1
+                0xD761_0080, (129 << 9) | 2, // v_writelane_b32 v128, s2, 1
+                0xD761_0080, (write_lane << 9) | write_src,
+                0xD760_0005, (read_lane << 9) | 384, // v_readlane_b32 s5, v128, lane
+                0xBEFE_0305, // s_mov_b32 exec_lo, s5
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ], false);
+            let s = structure(&p).unwrap();
+            let insts = &p.blocks[0].insts;
+            let guard = s.guards[0][6].unwrap();
+            if let Some(i) = expected {
+                assert_eq!(guard, s.masks[&insts[i].writes[0].1], "write={write_lane}, read={read_lane}");
+            } else {
+                let read = insts[4].write(Reg::S(5)).unwrap();
+                assert_eq!(s.bools.support(guard), [Atom::Opaque(read)], "write={write_lane}, read={read_lane}");
+            }
+        }
+    }
+
+    #[test]
     fn exec_narrowed_without_a_branch_leaves_a_guard() {
         let p = build(
             &[
