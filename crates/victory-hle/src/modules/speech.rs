@@ -1,10 +1,8 @@
 //! Accessibility: speech synthesis for the title's narration, spoken by
-//! the host's WinRT speech synthesizer in its default voice. Streams are
+//! the host's WinRT speech synthesizer in the selected Windows voice. Streams are
 //! WAVE files of 16 kHz mono 16-bit PCM, the console's format; with no
 //! voice installed (or off Windows) a stream is valid WAVE audio of no
 //! length and the narration is silent, as before.
-// shortcut: no voices are listed and the title's voice choice is ignored;
-// the host's default voice speaks everything.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -35,9 +33,8 @@ pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT)];
 /// The console's stream format: 16 kHz mono 16-bit PCM.
 const RATE: u32 = 16_000;
 
-/// Synthesizers hold nothing, so their handle is a fixed address and
-/// closing one is free. A stream's handle is its boxed WAVE file.
-static SYNTHESIZER: u8 = 0;
+mod voices;
+use voices::{close, create, enumerate_voices, set_custom_voice, set_default_voice};
 
 type This = *const Object;
 
@@ -145,8 +142,9 @@ fn plain(ssml: &str) -> String {
 /// The host's speech for `words` (SSML with `ssml`) as a WAVE file in the
 /// host synthesizer's format; `None` without a voice or on failure.
 #[cfg(windows)]
-fn speak(words: &str, ssml: bool) -> Option<Vec<u8>> {
+fn speak(words: &str, ssml: bool, voice: Option<&str>) -> Option<Vec<u8>> {
     let words = windows::core::HSTRING::from(words);
+    let voice = voice.map(windows::core::HSTRING::from);
     // A thread of our own in the multithreaded apartment, whatever the
     // title's thread initialised.
     let spoken = std::thread::spawn(move || -> windows::core::Result<Vec<u8>> {
@@ -156,6 +154,9 @@ fn speak(words: &str, ssml: bool) -> Option<Vec<u8>> {
         // SAFETY: initialises COM on this thread, which ends after the call.
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let synth = SpeechSynthesizer::new()?;
+        if let Some(id) = voice {
+            synth.SetVoice(&voices::find(&id)?)?;
+        }
         let stream = if ssml {
             synth.SynthesizeSsmlToStreamAsync(&words)?.join()?
         } else {
@@ -176,66 +177,54 @@ fn speak(words: &str, ssml: bool) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-fn speak(_: &str, _: bool) -> Option<Vec<u8>> {
+fn speak(_: &str, _: bool, _: Option<&str>) -> Option<Vec<u8>> {
     None
 }
 
 /// The narration of `words` at the console's format; SSML the host's
 /// synthesizer refuses is spoken as its plain text.
-fn narration(words: &str, ssml: bool) -> Vec<i16> {
+fn narration(words: &str, ssml: bool, voice: Option<&str>) -> Vec<i16> {
     if words.trim().is_empty() {
         return Vec::new();
     }
-    let host = speak(words, ssml).or_else(|| ssml.then(|| speak(&plain(words), false)).flatten());
+    let host = speak(words, ssml, voice)
+        .or_else(|| ssml.then(|| speak(&plain(words), false, voice)).flatten());
     host.and_then(|file| to_console(&file)).unwrap_or_default()
 }
 
-/// No voice is listed, so the callback never runs.
-extern "system" fn enumerate_voices(
-    _: This,
-    _context: *mut c_void,
-    _callback: *const c_void,
+fn create_stream(
+    handle: *const u8,
+    words: *const c_char,
+    ssml: bool,
+    out: *mut *const u8,
 ) -> HRESULT {
-    S_OK
-}
-extern "system" fn create(_: This, out: *mut *const u8) -> HRESULT {
-    put(out, &raw const SYNTHESIZER)
-}
-extern "system" fn close(_: This, _: *const u8) -> HRESULT {
-    S_OK
-}
-extern "system" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
-    S_OK
-}
-extern "system" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
-    S_OK
-}
-
-fn create_stream(words: *const c_char, ssml: bool, out: *mut *const u8) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
     let words = text(words).unwrap_or_default();
-    let samples = narration(&words, ssml);
+    let Some(voice) = voices::selected(handle) else {
+        return E_INVALIDARG;
+    };
+    let samples = narration(&words, ssml, voice.as_deref());
     tracing::debug!(text = words, samples = samples.len(), "speech");
     let file = Box::into_raw(Box::new(wave(&samples)));
     put(out, file.cast_const().cast())
 }
 extern "system" fn stream_from_text(
     _: This,
-    _: *const u8,
+    handle: *const u8,
     words: *const c_char,
     out: *mut *const u8,
 ) -> HRESULT {
-    create_stream(words, false, out)
+    create_stream(handle, words, false, out)
 }
 extern "system" fn stream_from_ssml(
     _: This,
-    _: *const u8,
+    handle: *const u8,
     ssml: *const c_char,
     out: *mut *const u8,
 ) -> HRESULT {
-    create_stream(ssml, true, out)
+    create_stream(handle, ssml, true, out)
 }
 
 /// The WAVE file behind a stream handle.
@@ -350,7 +339,7 @@ mod tests {
 
     #[test]
     fn text_and_ssml_are_spoken_when_a_voice_is_installed() {
-        if speak("a", false).is_none() {
+        if speak("a", false, None).is_none() {
             eprintln!("no voice; skipped");
             return;
         }
